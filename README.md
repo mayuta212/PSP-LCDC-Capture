@@ -1,3 +1,4 @@
+<img width="4080" height="3060" alt="IMG_20261008_153851989_HDR" src="https://github.com/user-attachments/assets/43a361eb-259c-46a7-be2e-6ab870c12d6a" />
 # PSP LCDC Capture
 
 PSPのLCDC映像と音声をUSB経由でPCへキャプチャするARK-5用PRX。
