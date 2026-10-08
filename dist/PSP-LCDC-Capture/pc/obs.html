@@ -1,0 +1,434 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+html, body { margin:0; width:100%; height:100%; overflow:hidden; background:#000; }
+canvas { width:100%; height:100%; display:block; image-rendering:pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c" width="480" height="272"></canvas>
+<script>
+(() => {
+  "use strict";
+
+  const USB_W = 512, W = 480, H = 272, PIXELS = W * H;
+  const FRAME16 = USB_W * H * 2, FRAME32 = USB_W * H * 4;
+  const canvas = document.getElementById("c");
+  const gl = canvas.getContext("webgl", {
+    alpha:false, antialias:false, depth:false, stencil:false
+  });
+
+  const rgba = new Uint8Array(PIXELS * 4);
+
+  const vs = `
+    attribute vec2 p;
+    attribute vec2 uv;
+    varying vec2 v;
+    void main(){ gl_Position=vec4(p,0.0,1.0); v=uv; }
+  `;
+  const fs = `
+    precision mediump float;
+    uniform sampler2D tex;
+    varying vec2 v;
+    void main(){ vec4 c=texture2D(tex, vec2(v.x,1.0-v.y)); gl_FragColor=vec4(c.rgb,1.0); }
+  `;
+
+  function sh(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
+      throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+
+  const prog = gl.createProgram();
+  gl.attachShader(prog, sh(gl.VERTEX_SHADER, vs));
+  gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(prog);
+  gl.useProgram(prog);
+
+  const verts = new Float32Array([
+    -1,-1, 0,0,
+     1,-1, 1,0,
+    -1, 1, 0,1,
+     1, 1, 1,1
+  ]);
+
+  const vb = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, vb);
+  gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+
+  const p = gl.getAttribLocation(prog, "p");
+  const uv = gl.getAttribLocation(prog, "uv");
+  gl.enableVertexAttribArray(p);
+  gl.enableVertexAttribArray(uv);
+  gl.vertexAttribPointer(p, 2, gl.FLOAT, false, 16, 0);
+  gl.vertexAttribPointer(uv, 2, gl.FLOAT, false, 16, 8);
+
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+
+  function expandNative(src, fmt) {
+    let si = 0, di = 0;
+    const rowSkip = (USB_W - W) * 2;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++, si += 2, di += 4) {
+        const q = src[si] | (src[si + 1] << 8);
+        let r, g, b;
+        if (fmt === 0) {          // PSP 565
+          r = q & 31; g = (q >>> 5) & 63; b = (q >>> 11) & 31;
+          rgba[di]   = (r << 3) | (r >>> 2);
+          rgba[di+1] = (g << 2) | (g >>> 4);
+          rgba[di+2] = (b << 3) | (b >>> 2);
+        } else if (fmt === 1) {   // PSP 5551
+          r = q & 31; g = (q >>> 5) & 31; b = (q >>> 10) & 31;
+          rgba[di]   = (r << 3) | (r >>> 2);
+          rgba[di+1] = (g << 3) | (g >>> 2);
+          rgba[di+2] = (b << 3) | (b >>> 2);
+        } else {                  // PSP 4444
+          r = q & 15; g = (q >>> 4) & 15; b = (q >>> 8) & 15;
+          rgba[di]   = (r << 4) | r;
+          rgba[di+1] = (g << 4) | g;
+          rgba[di+2] = (b << 4) | b;
+        }
+        rgba[di+3] = 255;
+      }
+      si += rowSkip;
+    }
+  }
+
+  function copy8888Native(src) {
+    const srcStride = USB_W * 4, dstStride = W * 4;
+    for (let y = 0; y < H; y++) {
+      const a = y * srcStride;
+      rgba.set(src.subarray(a, a + dstStride), y * dstStride);
+    }
+  }
+
+  function drawNative(buf) {
+    if (!(buf instanceof ArrayBuffer) ||
+        (buf.byteLength !== FRAME16 + 1 && buf.byteLength !== FRAME32 + 1))
+      return;
+    const bytes = new Uint8Array(buf);
+    const fmt = bytes[0];
+    if (fmt > 3 || (fmt === 3 && buf.byteLength !== FRAME32 + 1) ||
+        (fmt !== 3 && buf.byteLength !== FRAME16 + 1)) return;
+
+    if (fmt === 3) copy8888Native(bytes.subarray(1));
+    else expandNative(bytes.subarray(1), fmt);
+
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texSubImage2D(
+      gl.TEXTURE_2D, 0, 0, 0, W, H,
+      gl.RGBA, gl.UNSIGNED_BYTE, rgba
+    );
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+
+  // Reception and presentation are deliberately decoupled. WebSocket arrival
+  // may be 60, 47, 39... fps and irregular; only the newest complete frame is
+  // retained. Browser animation ticks (OBS 60 fps) decide when the canvas may
+  // change. No interpolation and no video queue: if nothing new arrived, the
+  // previous canvas image simply remains visible.
+  let latestVideo = null;
+  let latestVideoSerial = 0;
+  let presentedVideoSerial = 0;
+  let videoRx = 0, videoPresent = 0, videoReplaced = 0;
+
+  function acceptVideo(buf) {
+    if (!(buf instanceof ArrayBuffer)) return;
+    if (latestVideo !== null && latestVideoSerial !== presentedVideoSerial)
+      videoReplaced++;
+    latestVideo = buf;
+    latestVideoSerial++;
+    videoRx++;
+  }
+
+  function presentVideo() {
+    if (latestVideo !== null && latestVideoSerial !== presentedVideoSerial) {
+      const serial = latestVideoSerial;
+      const frame = latestVideo;
+      drawNative(frame);
+      presentedVideoSerial = serial;
+      if (latestVideoSerial === serial) latestVideo = null;
+      videoPresent++;
+    }
+    requestAnimationFrame(presentVideo);
+  }
+  requestAnimationFrame(presentVideo);
+
+  // AUDIO15 packet format: marker A0 + 24B header + signed PCM16.
+  // /audio is a separate TCP stream from the large /video frames.
+  const AUDIO_MAGIC = 0x31445541, AUDIO_RATE = 44100;
+  const LEAD_MS = 0, MAX_AHEAD_MS = 36;
+  const PSP_LEAD_MS = 12, PSP_MAX_AHEAD_MS = 64;
+  const DEBUG = new URLSearchParams(location.search).has('debug');
+  const lastSeqs = new Map();
+  let ctx = null, node = null, mode = 'uninitialized';
+  let initPromise = null, fallbackNext = new Map();
+  let pending = [], packets = 0, decoded = 0, dropped = 0, errors = 0;
+  let pcmPeak = 0, renderedFrames = 0, activeFifo = 0, underruns = 0;
+  let lastAudioAt = 0;
+
+  const audioStatus = document.createElement('div');
+  if (DEBUG) {
+    audioStatus.style.cssText = 'position:absolute;top:5px;left:5px;z-index:4;'+
+      'font:12px monospace;color:white;background:#000b;padding:6px;pointer-events:none;';
+    document.body.appendChild(audioStatus);
+    setInterval(() => {
+      audioStatus.textContent = 'AUDIO15 preroll=' + LEAD_MS + 'ms cap=' + MAX_AHEAD_MS + 'ms ' + mode + ' ' +
+        (ctx ? ctx.state + ' @' + ctx.sampleRate : 'not-started') +
+        ' packets=' + packets + ' queued=' + decoded +
+        ' samples-out=' + renderedFrames + ' fifo=' + activeFifo +
+        ' peak=' + pcmPeak.toFixed(3) +
+        ' dropped=' + dropped + ' underrun=' + underruns + ' err=' + errors +
+        ' last=' + Math.round(performance.now()-lastAudioAt) + 'ms';
+    }, 500);
+  }
+
+  // A real pull-driven mixer. Samples are consumed in 128-frame render quanta.
+  // Each PSP output channel has its own small queue; POPS uses one stereo queue.
+  const workletSource = `
+class LCDCLivePCM extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.queues = new Map();
+    this.preRoll = 794;
+    this.cap = 2117;
+    this.pspPreRoll = 529;
+    this.pspCap = 2823;
+    this.rendered = 0;
+    this.cycles = 0;
+    this.underruns = 0;
+    this.port.onmessage = e => {
+      const x = e.data;
+      if (x.type === 'reset') { this.queues.clear(); return; }
+      if (x.type === 'config') {
+        // Zero means start as soon as ANY PCM exists, not zero output-device latency.
+        this.preRoll = Math.max(0, Math.ceil(sampleRate*x.lead/1000));
+        this.cap = Math.max(this.preRoll+128, Math.ceil(sampleRate*x.cap/1000));
+        this.pspPreRoll = Math.max(0, Math.ceil(sampleRate*x.pspLead/1000));
+        this.pspCap = Math.max(this.pspPreRoll+128, Math.ceil(sampleRate*x.pspCap/1000));
+        return;
+      }
+      if (x.type !== 'pcm') return;
+      let q = this.queues.get(x.key);
+      if (!q) {
+        q = { l:new Float32Array(16384), r:new Float32Array(16384),
+              rd:0, wr:0, used:0, running:false, key:x.key };
+        this.queues.set(x.key, q);
+      }
+      const pcm = x.pcm;
+      const count = pcm.length >> 1;
+      // Enforce bounded sample age, not just bounded number of packets.
+      const limit = x.key === 'POPS' ? this.cap : this.pspCap;
+      const over = Math.max(0, q.used + count - limit);
+      if (over) {
+        const discard = Math.min(q.used, over);
+        q.rd = (q.rd + discard) % q.l.length;
+        q.used -= discard;
+      }
+      const start = Math.max(0, count - limit);
+      for (let i=start; i<count; i++) {
+        if (q.used >= limit) {
+          q.rd = (q.rd + 1) % q.l.length; q.used--;
+        }
+        q.l[q.wr] = pcm[2*i];
+        q.r[q.wr] = pcm[2*i+1];
+        q.wr = (q.wr + 1) % q.l.length;
+        q.used++;
+      }
+    };
+  }
+  process(_, outputs) {
+    const o = outputs[0];
+    if (!o || !o[0]) return true;
+    const L = o[0], R = o[1] || o[0];
+    L.fill(0); if (R !== L) R.fill(0);
+    for (const q of this.queues.values()) {
+      const headroom = q.key === 'POPS' ? this.preRoll : this.pspPreRoll;
+      if (!q.running && q.used > 0 && q.used >= headroom) q.running = true;
+      if (!q.running) continue;
+      for (let i=0; i<L.length; i++) {
+        if (q.used === 0) { q.running=false; this.underruns++; break; }
+        L[i] += q.l[q.rd];
+        this.rendered++;
+        if (R !== L) R[i] += q.r[q.rd];
+        q.rd = (q.rd+1) % q.l.length;
+        q.used--;
+      }
+    }
+    for (let i=0; i<L.length; i++) {
+      L[i] = Math.max(-1,Math.min(1,L[i]));
+      if (R !== L) R[i] = Math.max(-1,Math.min(1,R[i]));
+    }
+    if (++this.cycles % 200 === 0) {
+      let fifo = 0;
+      for (const q of this.queues.values()) fifo += q.used;
+      this.port.postMessage({type:'stats',rendered:this.rendered,fifo:fifo,underruns:this.underruns});
+    }
+    return true;
+  }
+}
+registerProcessor('lcdc60-live-pcm', LCDCLivePCM);
+`;
+
+  function fallback() {
+    if (!ctx) return;
+    mode = 'schedule-fallback';
+    while (pending.length) {
+      const x = pending.shift();
+      scheduleAudio(x);
+    }
+  }
+  function ensureAudio() {
+    if (ctx && ctx.state === 'closed') { ctx=null; node=null; initPromise=null; }
+    if (ctx) {
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+      return;
+    }
+    try {
+      const Type = window.AudioContext || window.webkitAudioContext;
+      if (!Type) { mode='no-web-audio'; return; }
+      ctx = new Type({sampleRate:AUDIO_RATE, latencyHint:'interactive'});
+      mode = 'initializing';
+      if (ctx.audioWorklet && window.AudioWorkletNode) {
+        const blobUrl = URL.createObjectURL(new Blob([workletSource],
+                                  {type:'text/javascript'}));
+        initPromise = ctx.audioWorklet.addModule(blobUrl).then(() => {
+          URL.revokeObjectURL(blobUrl);
+          node = new AudioWorkletNode(ctx, 'lcdc60-live-pcm',
+                     {numberOfInputs:0, numberOfOutputs:1, outputChannelCount:[2]});
+          node.connect(ctx.destination);
+          node.port.onmessage = e => {
+            if (e.data && e.data.type === 'stats') {
+              renderedFrames = e.data.rendered; activeFifo = e.data.fifo;
+              underruns = e.data.underruns;
+            }
+          };
+          node.port.postMessage({type:'config', lead:LEAD_MS, cap:MAX_AHEAD_MS, pspLead:PSP_LEAD_MS, pspCap:PSP_MAX_AHEAD_MS});
+          mode = 'ring-worklet';
+          while (pending.length) sendToWorklet(pending.shift());
+        }).catch(err => {
+          URL.revokeObjectURL(blobUrl);
+          console.warn('LCDC60 AudioWorklet unavailable; falling back:',err);
+          fallback();
+        });
+      } else fallback();
+      if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    } catch (err) { mode = 'audio-error'; errors++; console.error(err); }
+  }
+  // Fallback uses short explicit future scheduling; no long tail allowed.
+  function scheduleAudio(x) {
+    if (!ctx || ctx.state !== 'running') return;
+    const frameCount = x.pcm.length/2;
+    const buf = ctx.createBuffer(2, frameCount, AUDIO_RATE);
+    const l = buf.getChannelData(0), r = buf.getChannelData(1);
+    for (let i=0;i<frameCount;i++) {
+      l[i]=x.pcm[2*i]; r[i]=x.pcm[2*i+1];
+    }
+    const now = ctx.currentTime;
+    let start = fallbackNext.get(x.key) || 0;
+    if (start < now+0.003) start = now + Math.max(0.005, (x.key==='POPS'?LEAD_MS:PSP_LEAD_MS)/1000);
+    // When lag spikes, discard queued old sound rather than accumulating delay.
+    if (start > now + (x.key==='POPS'?MAX_AHEAD_MS:PSP_MAX_AHEAD_MS)/1000) { dropped++; return; }
+    const source = ctx.createBufferSource();
+    source.buffer = buf;
+    source.connect(ctx.destination);
+    source.start(start);
+    fallbackNext.set(x.key, start + buf.duration);
+    decoded++;
+  }
+  function sendToWorklet(x) {
+    if (!node) return;
+    node.port.postMessage({type:'pcm',key:x.key,pcm:x.pcm}, [x.pcm.buffer]);
+    decoded++;
+  }
+  function playAudio(data) {
+    if (!(data instanceof ArrayBuffer) || data.byteLength < 25) return;
+    const view = new DataView(data, 1);
+    const n = data.byteLength;
+    if (view.getUint32(0,true) !== AUDIO_MAGIC || view.getUint16(22,true) !== 1) {
+      errors++; return;
+    }
+    const seq = view.getUint32(4,true), frames = view.getUint16(12,true);
+    const source = view.getUint8(14), channel = view.getUint8(15);
+    const volumeL = view.getUint16(16,true)/32768;
+    const volumeR = view.getUint16(18,true)/32768;
+    const flags = view.getUint16(20,true), mono = !!(flags & 1);
+    if ((source !== 1 && source !== 2) || (source === 1 && channel !== 255) ||
+        (source === 2 && channel > 10) || flags & ~1 || frames < 1 || frames > 512 ||
+        n !== 25+frames*(mono ? 2 : 4)) { errors++; return; }
+    const key = source === 1 ? 'POPS' : 'PSP'+channel;
+    if (lastSeqs.get(key) === seq) return;
+    lastSeqs.set(key,seq);
+    let samples = new Float32Array(frames*2);
+    const pcm = new DataView(data,25);
+    let peak = 0;
+    for (let i=0;i<frames;i++) {
+      samples[2*i] = pcm.getInt16((mono ? i : 2*i)*2,true)/32768 * volumeL;
+      samples[2*i+1] = pcm.getInt16((mono ? i : 2*i+1)*2,true)/32768 * volumeR;
+      peak = Math.max(peak,Math.abs(samples[2*i]),Math.abs(samples[2*i+1]));
+    }
+    pcmPeak = peak;
+    packets++;
+    lastAudioAt = performance.now();
+    ensureAudio();
+    const x = {key:key,pcm:samples,recvAt:performance.now()};
+    if (mode === 'ring-worklet') sendToWorklet(x);
+    else if (mode === 'schedule-fallback') scheduleAudio(x);
+    else if (mode === 'initializing') {
+      pending.push(x);
+      // Keep no more than ~45ms of startup audio.
+      while (pending.length > 8 ||
+             (pending.length && performance.now()-pending[0].recvAt > MAX_AHEAD_MS)) {
+        pending.shift(); dropped++;
+      }
+    } else dropped++;
+  }
+  window.addEventListener('pointerdown', ensureAudio);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) ensureAudio();
+  });
+
+  // Two separate WebSockets: video must never sit in front of audio data.
+  function connectVideo() {
+    const ws = new WebSocket('ws://127.0.0.1:8766/video');
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = e => acceptVideo(e.data);
+    ws.onclose = () => setTimeout(connectVideo, 500);
+    ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  }
+  function connectAudio() {
+    const ws = new WebSocket('ws://127.0.0.1:8766/audio');
+    ws.binaryType = 'arraybuffer';
+    ws.onopen = () => { lastSeqs.clear(); pending=[];
+                       fallbackNext.clear();
+                       if (node) node.port.postMessage({type:'reset'});
+                       // Lazy-start WebAudio on first real PCM packet.
+                       };
+    ws.onmessage = e => playAudio(e.data);
+    ws.onclose = () => setTimeout(connectAudio, 500);
+    ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  }
+  setInterval(() => {
+    if (ctx && ctx.state === 'suspended' && performance.now()-lastAudioAt < 750)
+      ctx.resume().catch(() => {});
+  }, 250);
+
+  connectVideo();
+  connectAudio();
+
+})();
+</script>
+</body>
+</html>
+
