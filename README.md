@@ -2,7 +2,7 @@
 
 # PSP LCDC Capture
 
-PSPのLCDC映像と音声をUSB経由でPCへ表示と再生するARK-5用PRX。
+PSPの映像と音声をUSB経由でPCへ表示、再生するARK-5用PRX。
 
 ## 使い方
 
